@@ -1,6 +1,6 @@
 import { Injectable } from '@angular/core';
 import { getPublicKey, SimplePool, generateSecretKey } from '@nostr/tools';
-import { NostrCredentials } from '../dtos';
+import { NostrCredentials, NostrRoomSession } from '../dtos';
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 import { Subject } from 'rxjs';
 import { NostrEvent } from '@nostr/tools';
@@ -53,9 +53,9 @@ export class Nostr {
     };
   }
 
-  public initNostr(room: string): Subject<NostrEvent> {
+  public initNostr(room: string): NostrRoomSession {
     const subj = new Subject<NostrEvent>();
-    this.pool.subscribe(
+    const subscription = this.pool.subscribe(
       NOSTR_DEFAULT_RELAY_POOL as string[],
       {
         kinds: [NOSTR_EVENTS_KIND],
@@ -71,7 +71,13 @@ export class Nostr {
       },
     );
 
-    return subj;
+    return {
+      events$: subj,
+      close: () => {
+        subscription.close();
+        subj.complete();
+      },
+    };
   }
 
   public async sendEvent(content: unknown, room: string): Promise<void> {

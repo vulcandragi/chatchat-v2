@@ -34,6 +34,23 @@ export class WebRTC {
     delete this.peers[remotePubKey];
   }
 
+  public closeConnection(remotePubKey: string): void {
+    const pc = this.peers[remotePubKey];
+    if (!pc) return;
+
+    if (pc.signalingState != 'closed') {
+      pc.close();
+    }
+
+    delete this.peers[remotePubKey];
+  }
+
+  public closeAllConnections(): void {
+    for (const remotePubKey of Object.keys(this.peers)) {
+      this.closeConnection(remotePubKey);
+    }
+  }
+
   public getAllPeers(): WebRTCPeer[] {
     return Object.entries(this.peers).map(
       ([key, value]) =>

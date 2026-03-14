@@ -1,3 +1,6 @@
+import { NostrEvent } from '@nostr/tools';
+import { Subject } from 'rxjs';
+
 export interface NostrCredentials<T extends string | Uint8Array> {
   secreteKey: T;
   publicKey: string;
@@ -8,6 +11,7 @@ export enum WebRTCEventType {
   Offer,
   Answer,
   IceCandidate,
+  Leave,
 }
 
 export interface WebRTCNostrEvent {
@@ -15,6 +19,7 @@ export interface WebRTCNostrEvent {
   candidate?: RTCIceCandidateInit;
   sdp?: RTCSessionDescriptionInit;
   target?: string;
+  nick?: string;
 }
 
 export interface ChatCredentials {
@@ -23,9 +28,17 @@ export interface ChatCredentials {
 }
 
 export interface PeerMedia {
-  mediaStream: MediaStream;
+  mediaStream: MediaStream | null;
+  nick: string;
+  containerHtmlElement: HTMLDivElement;
+  nameHtmlElement: HTMLParagraphElement;
   audioHtmlElement: HTMLAudioElement;
   screenHtmlElement: HTMLVideoElement | null;
+}
+
+export interface NostrRoomSession {
+  close(): void;
+  events$: Subject<NostrEvent>;
 }
 
 export interface WebRTCPeer {

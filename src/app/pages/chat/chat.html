@@ -1,4 +1,12 @@
 <h1>Ouça atentamente, se ouvir coisas esta funcionando</h1>
 <h2>Se não ouvir faça barulho para o outro amiguinho ouvir algo!</h2>
 
-<button type="button" (click)="startScreenShare()">Compartilhar a tela!</button>
+<div class="chat-controls">
+  <button type="button" (click)="startScreenShare()">Compartilhar a tela!</button>
+  <button type="button" (click)="stopScreenShare()" [disabled]="!isScreenSharing()">
+    Parar compartilhamento
+  </button>
+  <button type="button" (click)="toggleMicrophone()">
+    {{ isMicrophoneMuted() ? 'Ativar microfone' : 'Mutar microfone' }}
+  </button>
+</div>

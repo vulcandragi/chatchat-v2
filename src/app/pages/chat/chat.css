@@ -1,0 +1,10 @@
+.chat-controls {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 16px 0 24px;
+}
+
+.chat-controls button {
+  padding: 10px 14px;
+}
