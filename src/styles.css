@@ -1,0 +1,22 @@
+.peer-card {
+  margin: 16px 0;
+  padding: 12px;
+  border: 1px solid #d0d7de;
+  border-radius: 12px;
+  background: #f6f8fa;
+}
+
+.peer-card__name {
+  margin: 0 0 8px;
+  font-weight: 600;
+}
+
+.peer-card__status {
+  margin-left: 8px;
+  font-weight: 400;
+  color: #6b7280;
+}
+
+.peer-card__reconnect {
+  margin-bottom: 8px;
+}

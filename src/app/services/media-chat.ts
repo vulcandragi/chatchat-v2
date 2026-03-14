@@ -4,19 +4,27 @@ import { Nostr } from './nostr';
 import { WebRTC } from './webrtc';
 import {
   ChatCredentials,
+  KnownPeer,
   NostrRoomSession,
   PeerMedia,
+  PeerSessionInfo,
   WebRTCEventType,
   WebRTCNostrEvent,
 } from '../dtos';
+
+interface PeerState {
+  media: PeerMedia | null;
+  session: PeerSessionInfo | null;
+  pendingIceCandidates: RTCIceCandidateInit[];
+  makingOffer: boolean;
+  ignoreOffer: boolean;
+  isSettingRemoteAnswerPending: boolean;
+}
 
 @Injectable({
   providedIn: 'root',
 })
 export class MediaChat {
-  private static readonly PRESENCE_INTERVAL_MS = 10000;
-  private static readonly STALE_PEER_TIMEOUT_MS = 45000;
-
   private readonly nostr = inject(Nostr);
   private readonly webRTC = inject(WebRTC);
   private readonly screenSharingState = signal(false);
@@ -26,21 +34,19 @@ export class MediaChat {
   private screenStream: MediaStream | null = null;
   private credentials: ChatCredentials | null = null;
   private roomSession: NostrRoomSession | null = null;
+  private localSessionId: string | null = null;
+  private localSessionStartedAt: number | null = null;
   private started = false;
-  private readonly peersStreams: Record<string, PeerMedia> = {};
-  private readonly peerNicks: Record<string, string> = {};
-  private readonly peerLastSeenAt: Record<string, number> = {};
-  private readonly pendingIceCandidates: Record<string, RTCIceCandidateInit[]> = {};
-  private readonly makingOffer: Record<string, boolean> = {};
-  private readonly ignoreOffer: Record<string, boolean> = {};
-  private readonly isSettingRemoteAnswerPending: Record<string, boolean> = {};
-  private presenceIntervalId: number | null = null;
-  private stalePeersIntervalId: number | null = null;
+  private readonly peers: Record<string, PeerState> = {};
+
   private readonly beforeUnloadHandler = (): void => {
     this.stop(false).catch((err) => {
       console.error('[MediaChat] stop on unload failed', err);
     });
   };
+
+  public readonly isScreenSharing = computed(() => this.screenSharingState());
+  public readonly isMicrophoneMuted = computed(() => this.microphoneMutedState());
 
   public init(credentials: ChatCredentials): void {
     this.credentials = credentials;
@@ -51,23 +57,15 @@ export class MediaChat {
     return Boolean(this.credentials);
   }
 
-  public readonly isScreenSharing = computed(() => this.screenSharingState());
-
-  public readonly isMicrophoneMuted = computed(() => this.microphoneMutedState());
-
   public async start(): Promise<void> {
     if (!this.isInitialized) throw Error('Chat requer ser configurado antes de ser iniciado.');
 
     if (this.started) {
-      this.log('restarting active session');
       await this.stop();
     }
 
-    this.log('starting room session', {
-      room: this.credentials!.room,
-      pubkey: this.nostr.myPublicKey,
-    });
-
+    this.localSessionId = crypto.randomUUID();
+    this.localSessionStartedAt = Date.now();
     this.mediaStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
       video: false,
@@ -86,9 +84,8 @@ export class MediaChat {
       },
     });
 
-    window.addEventListener('beforeunload', this.beforeUnloadHandler);
     this.started = true;
-    this.startPresenceLoop();
+    window.addEventListener('beforeunload', this.beforeUnloadHandler);
 
     await this.sendChatEvent(this.credentials!.room, {
       type: WebRTCEventType.Join,
@@ -96,9 +93,7 @@ export class MediaChat {
   }
 
   public async stop(notifyPeers: boolean = true): Promise<void> {
-    if (!this.started && !this.mediaStream && !this.screenStream && !this.roomSession) return;
-
-    this.log('stopping room session', { notifyPeers });
+    if (!this.started && !this.mediaStream && !this.roomSession) return;
 
     if (notifyPeers && this.credentials) {
       try {
@@ -111,21 +106,22 @@ export class MediaChat {
     }
 
     await this.stopScreenShare();
-
     this.mediaStream?.getTracks().forEach((track) => track.stop());
     this.mediaStream = null;
     this.microphoneMutedState.set(false);
 
     for (const peer of this.webRTC.getAllPeers()) {
-      this.cleanupPeer(peer.remotePubKey, 'local-stop');
+      this.webRTC.closeConnection(peer.remotePubKey);
     }
 
     this.roomSession?.close();
     this.roomSession = null;
+    this.localSessionId = null;
+    this.localSessionStartedAt = null;
     this.started = false;
-    this.stopPresenceLoop();
     window.removeEventListener('beforeunload', this.beforeUnloadHandler);
-    this.resetSignalingState();
+
+    this.clearAllPeers();
   }
 
   public async startScreenShare(): Promise<void> {
@@ -133,7 +129,6 @@ export class MediaChat {
 
     try {
       if (this.screenStream) {
-        this.log('replacing existing screen share');
         await this.stopScreenShare();
       }
 
@@ -144,17 +139,14 @@ export class MediaChat {
       this.screenSharingState.set(true);
 
       const screenTrack = this.screenStream.getVideoTracks()[0];
-      this.log('screen share started');
-
       for (const peer of this.webRTC.getAllPeers()) {
         peer.peerConnection.addTrack(screenTrack, this.screenStream);
-        this.requestOffer(peer.remotePubKey, 'screen-share-start').catch((err) => {
+        this.sendOffer(peer.remotePubKey, 'screen-share-start').catch((err) => {
           console.error('[MediaChat] failed to renegotiate screen share start', err);
         });
       }
 
       screenTrack.addEventListener('ended', () => {
-        this.log('local screen share ended by browser');
         this.stopScreenShare().catch((err) => {
           console.error('[MediaChat] failed to stop screen share', err);
         });
@@ -167,20 +159,20 @@ export class MediaChat {
   public async stopScreenShare(): Promise<void> {
     if (!this.screenStream) return;
 
-    this.log('stopping local screen share');
-
     this.screenStream.getTracks().forEach((track) => track.stop());
     this.screenStream = null;
     this.screenSharingState.set(false);
 
     for (const peer of this.webRTC.getAllPeers()) {
-      const senders = peer.peerConnection.getSenders();
-      const videoSenders = senders.filter((sender) => sender.track?.kind == 'video');
+      const videoSenders = peer.peerConnection
+        .getSenders()
+        .filter((sender) => sender.track?.kind === 'video');
+
       for (const videoSender of videoSenders) {
         peer.peerConnection.removeTrack(videoSender);
       }
 
-      this.requestOffer(peer.remotePubKey, 'screen-share-stop').catch((err) => {
+      this.sendOffer(peer.remotePubKey, 'screen-share-stop').catch((err) => {
         console.error('[MediaChat] failed to renegotiate screen share stop', err);
       });
     }
@@ -192,7 +184,25 @@ export class MediaChat {
 
     audioTrack.enabled = !audioTrack.enabled;
     this.microphoneMutedState.set(!audioTrack.enabled);
-    this.log(audioTrack.enabled ? 'microphone unmuted' : 'microphone muted');
+  }
+
+  public reconnectPeer(pubkey: string): void {
+    this.hardReconnectPeer(pubkey).catch((err) => {
+      console.error('[MediaChat] manual reconnect failed', { pubkey, err });
+    });
+  }
+
+  private getPeerState(pubkey: string): PeerState {
+    this.peers[pubkey] ??= {
+      media: null,
+      session: null,
+      pendingIceCandidates: [],
+      makingOffer: false,
+      ignoreOffer: false,
+      isSettingRemoteAnswerPending: false,
+    };
+
+    return this.peers[pubkey];
   }
 
   private async sendChatEvent(
@@ -200,89 +210,75 @@ export class MediaChat {
     content: WebRTCNostrEvent,
     targetPubkey?: string,
   ): Promise<void> {
+    if (!this.localSessionId || !this.localSessionStartedAt) {
+      throw new Error('Local session is not initialized.');
+    }
+
     const payload: WebRTCNostrEvent = {
       ...content,
       nick: content.nick ?? this.credentials?.nick,
+      sessionId: content.sessionId ?? this.localSessionId,
+      sessionStartedAt: content.sessionStartedAt ?? this.localSessionStartedAt,
       ...(targetPubkey ? { target: targetPubkey } : {}),
     };
 
     this.log('sending event', {
       type: WebRTCEventType[payload.type],
       target: payload.target ?? 'broadcast',
+      sessionId: payload.sessionId,
     });
 
     await this.nostr.sendEvent(payload, room);
   }
 
-  private async flushPendingIceCandidates(pubkey: string): Promise<void> {
-    const pc = this.webRTC.getPeerConnection(pubkey);
-    if (!pc?.remoteDescription) return;
-
-    const pendingCandidates = this.pendingIceCandidates[pubkey];
-    if (!pendingCandidates?.length) return;
-
-    this.log('flushing pending ICE candidates', {
-      pubkey,
-      count: pendingCandidates.length,
-    });
-
-    for (const candidate of pendingCandidates) {
-      await pc.addIceCandidate(new RTCIceCandidate(candidate));
-    }
-
-    delete this.pendingIceCandidates[pubkey];
-  }
-
   private createConnection(pubkey: string): RTCPeerConnection {
-    let pc = this.webRTC.getPeerConnection(pubkey);
-    if (pc) {
-      return pc;
+    const existingConnection = this.webRTC.getPeerConnection(pubkey);
+    if (existingConnection) {
+      return existingConnection;
     }
 
+    const pc = this.webRTC.connectToPeer(pubkey);
     this.log('creating peer connection', { pubkey, polite: this.isPolitePeer(pubkey) });
-    pc = this.webRTC.connectToPeer(pubkey);
 
     pc.addEventListener('track', (evt) => {
       const track = evt.track;
       const stream = evt.streams[0] ?? new MediaStream([track]);
-      this.log('remote track received', {
-        pubkey,
-        kind: track.kind,
-        streamCount: evt.streams.length,
-      });
-
       const peerMedia = this.ensurePeerMedia(pubkey);
-      let mediaElement: HTMLAudioElement | HTMLVideoElement;
 
-      if (track.kind == 'audio') {
-        mediaElement = peerMedia.audioHtmlElement;
-      } else if (track.kind == 'video') {
+      this.setPeerConnected(pubkey, true);
+
+      if (track.kind === 'audio') {
+        peerMedia.audioHtmlElement.srcObject = stream;
+        peerMedia.audioHtmlElement.autoplay = true;
+        void peerMedia.audioHtmlElement.play().catch(() => undefined);
+      }
+
+      if (track.kind === 'video') {
         peerMedia.screenHtmlElement?.remove();
 
         const videoElement = document.createElement('video');
         videoElement.playsInline = true;
         videoElement.controls = true;
         videoElement.style.width = '100%';
+        videoElement.srcObject = stream;
+        videoElement.autoplay = true;
         peerMedia.screenHtmlElement = videoElement;
-        mediaElement = videoElement;
-      } else {
-        return;
-      }
+        peerMedia.containerHtmlElement.appendChild(videoElement);
 
-      mediaElement.srcObject = stream;
-      mediaElement.autoplay = true;
-      void mediaElement.play().catch((err) => {
-        this.log('media element play deferred by browser', { pubkey, kind: track.kind, err });
-      });
-
-      if (!mediaElement.isConnected) {
-        peerMedia.containerHtmlElement.appendChild(mediaElement);
+        void videoElement.play().catch(() => undefined);
       }
 
       track.addEventListener('ended', () => {
-        this.log('remote track ended', { pubkey, kind: track.kind });
-        if (track.kind == 'audio' || track.kind == 'video') {
-          this.removePeerTrack(pubkey, track.kind);
+        if (track.kind === 'video') {
+          this.removeRemoteVideo(pubkey);
+        }
+
+        if (track.kind === 'audio') {
+          this.resetRemoteAudio(pubkey);
+        }
+
+        if (!this.hasRemoteMedia(pubkey)) {
+          this.setPeerConnected(pubkey, false);
         }
       });
     });
@@ -301,89 +297,57 @@ export class MediaChat {
     });
 
     pc.addEventListener('iceconnectionstatechange', () => {
-      this.log('ice connection state changed', {
-        pubkey,
-        state: pc.iceConnectionState,
-      });
+      if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'closed') {
+        this.markPeerDisconnected(pubkey, true, 'ice-failed');
+        return;
+      }
 
-      if (
-        pc.iceConnectionState == 'disconnected' ||
-        pc.iceConnectionState == 'failed' ||
-        pc.iceConnectionState == 'closed'
-      ) {
-        this.cleanupPeer(pubkey, `ice-${pc.iceConnectionState}`);
+      if (pc.iceConnectionState === 'disconnected') {
+        this.markPeerDisconnected(pubkey, false, 'ice-disconnected');
       }
     });
 
     pc.addEventListener('connectionstatechange', () => {
-      this.log('peer connection state changed', {
-        pubkey,
-        state: pc.connectionState,
-      });
-
-      if (
-        pc.connectionState == 'disconnected' ||
-        pc.connectionState == 'failed' ||
-        pc.connectionState == 'closed'
-      ) {
-        this.cleanupPeer(pubkey, `connection-${pc.connectionState}`);
+      if (pc.connectionState === 'connected') {
+        this.setPeerConnected(pubkey, true);
         return;
+      }
+
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        this.markPeerDisconnected(pubkey, true, 'connection-failed');
+        return;
+      }
+
+      if (pc.connectionState === 'disconnected') {
+        this.markPeerDisconnected(pubkey, false, 'connection-disconnected');
       }
     });
 
     pc.addEventListener('negotiationneeded', async () => {
-      this.log('negotiation needed', {
-        pubkey,
-        signalingState: pc.signalingState,
-      });
-
-      try {
-        await this.requestOffer(pubkey, 'negotiationneeded');
-      } catch (err) {
-        console.error('[MediaChat] negotiation failed', { pubkey, err });
-      }
+      await this.sendOffer(pubkey, 'negotiationneeded');
     });
 
-    this.mediaStream?.getTracks().forEach((track) => pc.addTrack(track, this.mediaStream!));
-    this.screenStream?.getTracks().forEach((track) => pc.addTrack(track, this.screenStream!));
-
+    this.attachLocalTracks(pc);
     return pc;
   }
 
+  private attachLocalTracks(pc: RTCPeerConnection): void {
+    this.mediaStream?.getTracks().forEach((track) => pc.addTrack(track, this.mediaStream!));
+    this.screenStream?.getTracks().forEach((track) => pc.addTrack(track, this.screenStream!));
+  }
+
   private async handleEvent(content: WebRTCNostrEvent, pubkey: string): Promise<void> {
-    this.log('received event', {
-      from: pubkey,
-      type: WebRTCEventType[content.type],
-      target: content.target ?? 'broadcast',
-    });
+    if (content.target && content.target !== this.nostr.myPublicKey) return;
+    if (!this.acceptPeerEvent(pubkey, content)) return;
 
-    if (content.target && content.target != this.nostr.myPublicKey) return;
-
-    this.peerLastSeenAt[pubkey] = Date.now();
+    const peer = this.getPeerState(pubkey);
 
     if (content.nick) {
-      this.peerNicks[pubkey] = content.nick;
       this.updatePeerNick(pubkey, content.nick);
     }
 
-    if (content.type == WebRTCEventType.Join) {
-      const existingPeer = this.webRTC.getPeerConnection(pubkey);
-
-      if (existingPeer && !this.isPeerHealthy(existingPeer)) {
-        this.log('replacing stale peer after join', {
-          pubkey,
-          connectionState: existingPeer.connectionState,
-          iceConnectionState: existingPeer.iceConnectionState,
-          signalingState: existingPeer.signalingState,
-        });
-        this.cleanupPeer(pubkey, 'join-reconnect');
-      }
-
+    if (content.type === WebRTCEventType.Join) {
       this.createConnection(pubkey);
-
-      if (!existingPeer || !this.isPeerHealthy(existingPeer)) {
-        await this.requestOffer(pubkey, 'join');
-      }
 
       if (!content.target) {
         await this.sendChatEvent(
@@ -393,44 +357,48 @@ export class MediaChat {
           },
           pubkey,
         );
+
+        await this.sendChatEvent(
+          this.credentials?.room!,
+          {
+            type: WebRTCEventType.Peers,
+            peers: this.getKnownPeers(pubkey),
+          },
+          pubkey,
+        );
+      }
+
+      await this.sendOffer(pubkey, 'join');
+      return;
+    }
+
+    if (content.type === WebRTCEventType.Peers) {
+      for (const knownPeer of content.peers ?? []) {
+        await this.discoverPeer(knownPeer);
       }
 
       return;
     }
 
-    if (content.type == WebRTCEventType.Leave) {
-      this.cleanupPeer(pubkey, 'remote-leave');
+    if (content.type === WebRTCEventType.Leave) {
+      this.removePeer(pubkey, true);
       return;
     }
 
-    if (content.type == WebRTCEventType.Offer) {
+    if (content.type === WebRTCEventType.Offer) {
       const pc = this.createConnection(pubkey);
       const readyForOffer =
-        !this.makingOffer[pubkey] &&
-        (pc.signalingState == 'stable' || this.isSettingRemoteAnswerPending[pubkey] === true);
+        !peer.makingOffer && (pc.signalingState === 'stable' || peer.isSettingRemoteAnswerPending);
       const offerCollision = !readyForOffer;
-      const ignoreOffer = !this.isPolitePeer(pubkey) && offerCollision;
 
-      this.ignoreOffer[pubkey] = ignoreOffer;
-
-      this.log('processing offer', {
-        pubkey,
-        polite: this.isPolitePeer(pubkey),
-        offerCollision,
-        ignoreOffer,
-        signalingState: pc.signalingState,
-      });
-
-      if (ignoreOffer) {
-        return;
-      }
+      peer.ignoreOffer = !this.isPolitePeer(pubkey) && offerCollision;
+      if (peer.ignoreOffer) return;
 
       await pc.setRemoteDescription(new RTCSessionDescription(content.sdp!));
-      await this.flushPendingIceCandidates(pubkey);
+      await this.flushPendingIce(pubkey);
 
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
-
       await this.sendChatEvent(
         this.credentials?.room!,
         {
@@ -439,215 +407,67 @@ export class MediaChat {
         },
         pubkey,
       );
-
       return;
     }
 
-    if (content.type == WebRTCEventType.Answer) {
+    if (content.type === WebRTCEventType.Answer) {
       const pc = this.webRTC.getPeerConnection(pubkey);
       if (!pc || !content.sdp) return;
 
-      this.isSettingRemoteAnswerPending[pubkey] = true;
+      peer.isSettingRemoteAnswerPending = true;
 
       try {
         await pc.setRemoteDescription(new RTCSessionDescription(content.sdp));
-        await this.flushPendingIceCandidates(pubkey);
+        await this.flushPendingIce(pubkey);
       } finally {
-        this.isSettingRemoteAnswerPending[pubkey] = false;
+        peer.isSettingRemoteAnswerPending = false;
       }
 
       return;
     }
 
-    if (content.type == WebRTCEventType.IceCandidate) {
+    if (content.type === WebRTCEventType.IceCandidate) {
       const pc = this.webRTC.getPeerConnection(pubkey) ?? this.createConnection(pubkey);
       if (!content.candidate) return;
 
       if (!pc.remoteDescription) {
-        this.log('queueing ICE candidate until remote description exists', { pubkey });
-        this.pendingIceCandidates[pubkey] ??= [];
-        this.pendingIceCandidates[pubkey].push(content.candidate);
+        peer.pendingIceCandidates.push(content.candidate);
         return;
       }
 
       try {
         await pc.addIceCandidate(new RTCIceCandidate(content.candidate));
       } catch (err) {
-        if (this.ignoreOffer[pubkey]) {
-          this.log('ignored ICE candidate after ignored offer', { pubkey });
-          return;
+        if (!peer.ignoreOffer) {
+          throw err;
         }
-
-        throw err;
       }
     }
   }
 
-  private ensurePeerMedia(pubkey: string): PeerMedia {
-    if (this.peersStreams[pubkey]) {
-      return this.peersStreams[pubkey];
+  private async flushPendingIce(pubkey: string): Promise<void> {
+    const peer = this.getPeerState(pubkey);
+    const pc = this.webRTC.getPeerConnection(pubkey);
+    if (!pc?.remoteDescription || !peer.pendingIceCandidates.length) return;
+
+    for (const candidate of peer.pendingIceCandidates) {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
     }
 
-    const containerElement = document.createElement('div');
-    const nameElement = document.createElement('p');
-    const audioElement = document.createElement('audio');
-    const nick = this.peerNicks[pubkey] ?? this.formatPeerName(pubkey);
-
-    containerElement.style.margin = '16px 0';
-    containerElement.style.padding = '12px';
-    containerElement.style.border = '1px solid #d0d7de';
-    containerElement.style.borderRadius = '12px';
-    containerElement.style.background = '#f6f8fa';
-
-    nameElement.textContent = nick;
-    nameElement.style.margin = '0 0 8px';
-    nameElement.style.fontWeight = '600';
-
-    audioElement.autoplay = true;
-    audioElement.controls = true;
-
-    containerElement.appendChild(nameElement);
-    containerElement.appendChild(audioElement);
-    document.body.appendChild(containerElement);
-
-    this.peersStreams[pubkey] = {
-      mediaStream: null,
-      nick,
-      containerHtmlElement: containerElement,
-      nameHtmlElement: nameElement,
-      audioHtmlElement: audioElement,
-      screenHtmlElement: null,
-    };
-
-    return this.peersStreams[pubkey];
+    peer.pendingIceCandidates = [];
   }
 
-  private removePeerTrack(pubkey: string, kind: 'audio' | 'video'): void {
-    const peerMedia = this.peersStreams[pubkey];
-    if (!peerMedia) return;
-
-    if (kind == 'video') {
-      peerMedia.screenHtmlElement?.remove();
-      peerMedia.screenHtmlElement = null;
-      if (!peerMedia.audioHtmlElement.isConnected) {
-        peerMedia.containerHtmlElement.remove();
-        delete this.peersStreams[pubkey];
-      }
-      return;
-    }
-
-    peerMedia.audioHtmlElement.remove();
-
-    if (!peerMedia.screenHtmlElement) {
-      peerMedia.containerHtmlElement.remove();
-      delete this.peersStreams[pubkey];
-      return;
-    }
-
-    const replacementAudioElement = document.createElement('audio');
-    replacementAudioElement.autoplay = true;
-    replacementAudioElement.controls = true;
-    peerMedia.containerHtmlElement.appendChild(replacementAudioElement);
-    peerMedia.audioHtmlElement = replacementAudioElement;
-  }
-
-  private cleanupPeer(pubkey: string, reason: string): void {
-    this.log('cleaning peer', { pubkey, reason });
-
-    const peerMedia = this.peersStreams[pubkey];
-    peerMedia?.containerHtmlElement.remove();
-    peerMedia?.screenHtmlElement?.remove();
-    peerMedia?.audioHtmlElement?.remove();
-    delete this.peersStreams[pubkey];
-    delete this.peerNicks[pubkey];
-    delete this.peerLastSeenAt[pubkey];
-    delete this.pendingIceCandidates[pubkey];
-    delete this.makingOffer[pubkey];
-    delete this.ignoreOffer[pubkey];
-    delete this.isSettingRemoteAnswerPending[pubkey];
-
-    this.webRTC.closeConnection(pubkey);
-  }
-
-  private resetSignalingState(): void {
-    for (const key of Object.keys(this.peerLastSeenAt)) {
-      delete this.peerLastSeenAt[key];
-    }
-
-    for (const key of Object.keys(this.peerNicks)) {
-      delete this.peerNicks[key];
-    }
-
-    for (const key of Object.keys(this.pendingIceCandidates)) {
-      delete this.pendingIceCandidates[key];
-    }
-
-    for (const key of Object.keys(this.makingOffer)) {
-      delete this.makingOffer[key];
-    }
-
-    for (const key of Object.keys(this.ignoreOffer)) {
-      delete this.ignoreOffer[key];
-    }
-
-    for (const key of Object.keys(this.isSettingRemoteAnswerPending)) {
-      delete this.isSettingRemoteAnswerPending[key];
-    }
-  }
-
-  private isPolitePeer(pubkey: string): boolean {
-    return this.nostr.myPublicKey.localeCompare(pubkey) > 0;
-  }
-
-  private isPeerHealthy(pc: RTCPeerConnection): boolean {
-    if (pc.connectionState == 'connected') {
-      return true;
-    }
-
-    if (
-      pc.connectionState == 'failed' ||
-      pc.connectionState == 'disconnected' ||
-      pc.connectionState == 'closed'
-    ) {
-      return false;
-    }
-
-    if (
-      pc.iceConnectionState == 'failed' ||
-      pc.iceConnectionState == 'disconnected' ||
-      pc.iceConnectionState == 'closed'
-    ) {
-      return false;
-    }
-
-    if (pc.signalingState == 'closed') {
-      return false;
-    }
-
-    return true;
-  }
-
-  private async requestOffer(pubkey: string, reason: string): Promise<void> {
+  private async sendOffer(pubkey: string, reason: string): Promise<void> {
     const pc = this.webRTC.getPeerConnection(pubkey);
     if (!pc) return;
 
-    if (this.makingOffer[pubkey]) {
-      this.log('skipping offer request while another offer is in progress', { pubkey, reason });
-      return;
-    }
-
-    if (pc.signalingState != 'stable') {
-      this.log('skipping offer request because signaling is not stable', {
-        pubkey,
-        reason,
-        signalingState: pc.signalingState,
-      });
-      return;
-    }
+    const peer = this.getPeerState(pubkey);
+    if (peer.makingOffer) return;
+    if (pc.signalingState !== 'stable') return;
 
     try {
-      this.makingOffer[pubkey] = true;
-      this.log('creating explicit offer', { pubkey, reason });
+      peer.makingOffer = true;
+      this.log('creating offer', { pubkey, reason });
 
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
@@ -661,61 +481,264 @@ export class MediaChat {
         pubkey,
       );
     } finally {
-      this.makingOffer[pubkey] = false;
+      peer.makingOffer = false;
     }
   }
 
-  private updatePeerNick(pubkey: string, nick: string): void {
-    const peerMedia = this.peersStreams[pubkey];
-    if (!peerMedia) return;
+  private async hardReconnectPeer(pubkey: string): Promise<void> {
+    await this.sendChatEvent(
+      this.credentials?.room!,
+      {
+        type: WebRTCEventType.Leave,
+      },
+      pubkey,
+    );
 
-    peerMedia.nick = nick;
-    peerMedia.nameHtmlElement.textContent = nick;
+    this.removePeer(pubkey, false);
+    this.createConnection(pubkey);
+
+    await this.sendChatEvent(
+      this.credentials?.room!,
+      {
+        type: WebRTCEventType.Join,
+      },
+      pubkey,
+    );
+    await this.sendOffer(pubkey, 'manual-reconnect');
+  }
+
+  private async discoverPeer(peer: KnownPeer): Promise<void> {
+    if (peer.pubkey === this.nostr.myPublicKey) return;
+
+    const state = this.getPeerState(peer.pubkey);
+    state.session = {
+      sessionId: peer.sessionId,
+      sessionStartedAt: peer.sessionStartedAt,
+    };
+
+    if (peer.nick) {
+      this.updatePeerNick(peer.pubkey, peer.nick);
+    }
+
+    this.ensurePeerMedia(peer.pubkey);
+
+    if (!this.webRTC.getPeerConnection(peer.pubkey)) {
+      this.createConnection(peer.pubkey);
+      await this.sendChatEvent(
+        this.credentials?.room!,
+        {
+          type: WebRTCEventType.Join,
+        },
+        peer.pubkey,
+      );
+      await this.sendOffer(peer.pubkey, 'peer-share');
+    }
+  }
+
+  private acceptPeerEvent(pubkey: string, content: WebRTCNostrEvent): boolean {
+    if (!content.sessionId || !content.sessionStartedAt) {
+      return false;
+    }
+
+    const peer = this.getPeerState(pubkey);
+    const incomingSession: PeerSessionInfo = {
+      sessionId: content.sessionId,
+      sessionStartedAt: content.sessionStartedAt,
+    };
+
+    if (!peer.session) {
+      peer.session = incomingSession;
+      return true;
+    }
+
+    if (peer.session.sessionId === incomingSession.sessionId) {
+      return true;
+    }
+
+    if (incomingSession.sessionStartedAt < peer.session.sessionStartedAt) {
+      this.log('ignoring stale session event', {
+        pubkey,
+        incomingSession,
+        knownSession: peer.session,
+      });
+      return false;
+    }
+
+    this.log('switching to newer peer session', {
+      pubkey,
+      incomingSession,
+      knownSession: peer.session,
+    });
+    this.removePeer(pubkey, false);
+    this.getPeerState(pubkey).session = incomingSession;
+    return true;
+  }
+
+  private ensurePeerMedia(pubkey: string): PeerMedia {
+    const peer = this.getPeerState(pubkey);
+    if (peer.media) {
+      return peer.media;
+    }
+
+    const containerElement = document.createElement('div');
+    const nameElement = document.createElement('p');
+    const nameLabelElement = document.createElement('span');
+    const statusElement = document.createElement('span');
+    const reconnectButtonElement = document.createElement('button');
+    const audioElement = this.createAudioElement();
+    const nick = this.formatPeerName(pubkey);
+
+    containerElement.className = 'peer-card';
+    nameElement.className = 'peer-card__name';
+    statusElement.className = 'peer-card__status';
+    nameLabelElement.textContent = nick;
+
+    reconnectButtonElement.type = 'button';
+    reconnectButtonElement.textContent = 'Reconectar';
+    reconnectButtonElement.className = 'peer-card__reconnect';
+    reconnectButtonElement.addEventListener('click', () => {
+      this.reconnectPeer(pubkey);
+    });
+
+    nameElement.appendChild(nameLabelElement);
+    nameElement.appendChild(statusElement);
+    containerElement.appendChild(nameElement);
+    containerElement.appendChild(reconnectButtonElement);
+    containerElement.appendChild(audioElement);
+    document.body.appendChild(containerElement);
+
+    peer.media = {
+      mediaStream: null,
+      nick,
+      containerHtmlElement: containerElement,
+      nameHtmlElement: nameElement,
+      nameLabelHtmlElement: nameLabelElement,
+      statusHtmlElement: statusElement,
+      reconnectButtonHtmlElement: reconnectButtonElement,
+      audioHtmlElement: audioElement,
+      screenHtmlElement: null,
+    };
+
+    this.setPeerConnected(pubkey, false);
+    return peer.media;
+  }
+
+  private createAudioElement(): HTMLAudioElement {
+    const audioElement = document.createElement('audio');
+    audioElement.autoplay = true;
+    audioElement.controls = true;
+    return audioElement;
+  }
+
+  private updatePeerNick(pubkey: string, nick: string): void {
+    const media = this.ensurePeerMedia(pubkey);
+    media.nick = nick;
+    media.nameLabelHtmlElement.textContent = nick;
+  }
+
+  private setPeerConnected(pubkey: string, connected: boolean): void {
+    const media = this.ensurePeerMedia(pubkey);
+    media.statusHtmlElement.textContent = connected ? '' : ' (desconectado)';
+  }
+
+  private removeRemoteVideo(pubkey: string): void {
+    const media = this.getPeerState(pubkey).media;
+    if (!media) return;
+
+    media.screenHtmlElement?.remove();
+    media.screenHtmlElement = null;
+  }
+
+  private resetRemoteAudio(pubkey: string): void {
+    const media = this.getPeerState(pubkey).media;
+    if (!media) return;
+
+    media.audioHtmlElement.remove();
+    media.audioHtmlElement = this.createAudioElement();
+    media.containerHtmlElement.appendChild(media.audioHtmlElement);
+  }
+
+  private hasRemoteMedia(pubkey: string): boolean {
+    const media = this.getPeerState(pubkey).media;
+    if (!media) return false;
+
+    return Boolean(media.audioHtmlElement.srcObject || media.screenHtmlElement?.srcObject);
+  }
+
+  private markPeerDisconnected(pubkey: string, resetConnection: boolean, reason: string): void {
+    this.log('peer disconnected', { pubkey, reason, resetConnection });
+    this.setPeerConnected(pubkey, false);
+
+    if (resetConnection) {
+      this.webRTC.closeConnection(pubkey);
+    }
+  }
+
+  private removePeer(pubkey: string, removeCard: boolean): void {
+    this.webRTC.closeConnection(pubkey);
+
+    const peer = this.peers[pubkey];
+    if (!peer) return;
+
+    if (removeCard) {
+      peer.media?.containerHtmlElement.remove();
+      delete this.peers[pubkey];
+      return;
+    }
+
+    peer.pendingIceCandidates = [];
+    peer.makingOffer = false;
+    peer.ignoreOffer = false;
+    peer.isSettingRemoteAnswerPending = false;
+    if (peer.media) {
+      peer.media.audioHtmlElement.srcObject = null;
+      this.removeRemoteVideo(pubkey);
+      this.resetRemoteAudio(pubkey);
+      this.setPeerConnected(pubkey, false);
+    }
+  }
+
+  private getKnownPeers(targetPubkey: string): KnownPeer[] {
+    if (!this.localSessionId || !this.localSessionStartedAt) {
+      return [];
+    }
+
+    const peers: KnownPeer[] = [
+      {
+        pubkey: this.nostr.myPublicKey,
+        nick: this.credentials?.nick,
+        sessionId: this.localSessionId,
+        sessionStartedAt: this.localSessionStartedAt,
+      },
+    ];
+
+    for (const [pubkey, peer] of Object.entries(this.peers)) {
+      if (pubkey === targetPubkey || !peer.session) continue;
+
+      peers.push({
+        pubkey,
+        nick: peer.media?.nick,
+        sessionId: peer.session.sessionId,
+        sessionStartedAt: peer.session.sessionStartedAt,
+      });
+    }
+
+    return peers;
+  }
+
+  private clearAllPeers(): void {
+    for (const [pubkey, peer] of Object.entries(this.peers)) {
+      peer.media?.containerHtmlElement.remove();
+      delete this.peers[pubkey];
+    }
+  }
+
+  private isPolitePeer(pubkey: string): boolean {
+    return this.nostr.myPublicKey.localeCompare(pubkey) > 0;
   }
 
   private formatPeerName(pubkey: string): string {
     return `User ${pubkey.slice(0, 8)}`;
-  }
-
-  private startPresenceLoop(): void {
-    this.stopPresenceLoop();
-
-    this.presenceIntervalId = window.setInterval(() => {
-      if (!this.credentials) return;
-
-      this.sendChatEvent(this.credentials.room, {
-        type: WebRTCEventType.Join,
-      }).catch((err) => {
-        console.error('[MediaChat] failed to send presence heartbeat', err);
-      });
-    }, MediaChat.PRESENCE_INTERVAL_MS);
-
-    this.stalePeersIntervalId = window.setInterval(() => {
-      const now = Date.now();
-
-      for (const [pubkey, lastSeenAt] of Object.entries(this.peerLastSeenAt)) {
-        if (now - lastSeenAt < MediaChat.STALE_PEER_TIMEOUT_MS) continue;
-
-        this.log('peer timed out from missing presence', {
-          pubkey,
-          lastSeenAt,
-          now,
-        });
-        this.cleanupPeer(pubkey, 'presence-timeout');
-      }
-    }, MediaChat.PRESENCE_INTERVAL_MS);
-  }
-
-  private stopPresenceLoop(): void {
-    if (this.presenceIntervalId !== null) {
-      window.clearInterval(this.presenceIntervalId);
-      this.presenceIntervalId = null;
-    }
-
-    if (this.stalePeersIntervalId !== null) {
-      window.clearInterval(this.stalePeersIntervalId);
-      this.stalePeersIntervalId = null;
-    }
   }
 
   private log(message: string, context?: unknown): void {

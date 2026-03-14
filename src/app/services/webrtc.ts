@@ -38,7 +38,7 @@ export class WebRTC {
     const pc = this.peers[remotePubKey];
     if (!pc) return;
 
-    if (pc.signalingState != 'closed') {
+    if (pc.signalingState !== 'closed') {
       pc.close();
     }
 

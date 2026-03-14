@@ -12,6 +12,19 @@ export enum WebRTCEventType {
   Answer,
   IceCandidate,
   Leave,
+  Peers,
+}
+
+export interface KnownPeer {
+  pubkey: string;
+  nick?: string;
+  sessionId: string;
+  sessionStartedAt: number;
+}
+
+export interface PeerSessionInfo {
+  sessionId: string;
+  sessionStartedAt: number;
 }
 
 export interface WebRTCNostrEvent {
@@ -20,6 +33,9 @@ export interface WebRTCNostrEvent {
   sdp?: RTCSessionDescriptionInit;
   target?: string;
   nick?: string;
+  peers?: KnownPeer[];
+  sessionId?: string;
+  sessionStartedAt?: number;
 }
 
 export interface ChatCredentials {
@@ -32,6 +48,9 @@ export interface PeerMedia {
   nick: string;
   containerHtmlElement: HTMLDivElement;
   nameHtmlElement: HTMLParagraphElement;
+  nameLabelHtmlElement: HTMLSpanElement;
+  statusHtmlElement: HTMLSpanElement;
+  reconnectButtonHtmlElement: HTMLButtonElement;
   audioHtmlElement: HTMLAudioElement;
   screenHtmlElement: HTMLVideoElement | null;
 }
