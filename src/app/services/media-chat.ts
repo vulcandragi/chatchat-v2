@@ -214,14 +214,6 @@ export class MediaChat {
     if (content.target && content.target != this.nostr.myPublicKey) return;
 
     if (content.type == WebRTCEventType.Join) {
-      // const pc = this.createConnection(pubkey);
-      // const offer = await pc.createOffer();
-      // await pc.setLocalDescription(offer);
-      // await this.sendChatEvent(this.credentials?.room!, {
-      //   type: WebRTCEventType.Offer,
-      //   sdp: offer,
-      // });
-
       this.createConnection(pubkey);
 
       return;
