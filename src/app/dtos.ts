@@ -12,7 +12,7 @@ export enum WebRTCEventType {
 
 export interface WebRTCNostrEvent {
   type: WebRTCEventType;
-  candidate?: RTCIceCandidate;
+  candidate?: RTCIceCandidateInit;
   sdp?: RTCSessionDescriptionInit;
   target?: string;
 }

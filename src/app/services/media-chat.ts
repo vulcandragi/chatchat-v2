@@ -14,6 +14,7 @@ export class MediaChat {
   private screenStream: MediaStream | null = null;
   private credentials: ChatCredentials | null = null;
   private readonly peersStreams: Record<string, PeerMedia> = {};
+  private readonly pendingIceCandidates: Record<string, RTCIceCandidateInit[]> = {};
 
   public init(credentials: ChatCredentials): void {
     this.credentials = credentials;
@@ -92,6 +93,20 @@ export class MediaChat {
     await this.nostr.sendEvent(content, room);
   }
 
+  private async flushPendingIceCandidates(pubkey: string): Promise<void> {
+    const pc = this.webRTC.getPeerConnection(pubkey);
+    if (!pc?.remoteDescription) return;
+
+    const pendingCandidates = this.pendingIceCandidates[pubkey];
+    if (!pendingCandidates?.length) return;
+
+    for (const candidate of pendingCandidates) {
+      await pc.addIceCandidate(new RTCIceCandidate(candidate));
+    }
+
+    delete this.pendingIceCandidates[pubkey];
+  }
+
   private createConnection(pubkey: string): RTCPeerConnection {
     let pc = this.webRTC.getPeerConnection(pubkey);
     if (pc) {
@@ -104,6 +119,14 @@ export class MediaChat {
       console.log('webrtc evt', evt);
       const track = evt.track;
       const stream = evt.streams[0];
+      if (!this.peersStreams[pubkey]) {
+        this.peersStreams[pubkey] = {
+          mediaStream: stream,
+          audioHtmlElement: document.createElement('audio'),
+          screenHtmlElement: null,
+        };
+      }
+
       let mediaElement: HTMLAudioElement | HTMLVideoElement;
 
       if (track.kind == 'audio') {
@@ -167,7 +190,7 @@ export class MediaChat {
         this.credentials?.room!,
         {
           type: WebRTCEventType.IceCandidate,
-          candidate: evt.candidate ?? undefined,
+          candidate: evt.candidate.toJSON(),
         },
         pubkey,
       );
@@ -179,11 +202,13 @@ export class MediaChat {
         pc.iceConnectionState == 'failed' ||
         pc.iceConnectionState == 'closed'
       ) {
-        const peerStream = this.peersStreams[pubkey];
-        this.peersStreams[pubkey].screenHtmlElement?.remove();
-        this.peersStreams[pubkey].screenHtmlElement = null;
-        this.peersStreams[pubkey].audioHtmlElement?.remove();
+        this.peersStreams[pubkey]?.screenHtmlElement?.remove();
+        if (this.peersStreams[pubkey]) {
+          this.peersStreams[pubkey].screenHtmlElement = null;
+        }
+        this.peersStreams[pubkey]?.audioHtmlElement?.remove();
         delete this.peersStreams[pubkey];
+        delete this.pendingIceCandidates[pubkey];
       }
     });
 
@@ -222,6 +247,7 @@ export class MediaChat {
     if (content.type == WebRTCEventType.Offer) {
       const pc = this.createConnection(pubkey);
       await pc.setRemoteDescription(new RTCSessionDescription(content.sdp!));
+      await this.flushPendingIceCandidates(pubkey);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       await this.sendChatEvent(
@@ -237,16 +263,23 @@ export class MediaChat {
     }
 
     if (content.type == WebRTCEventType.Answer) {
-      this.webRTC
-        .getPeerConnection(pubkey)
-        ?.setRemoteDescription(new RTCSessionDescription(content.sdp!));
+      const pc = this.webRTC.getPeerConnection(pubkey);
+      await pc?.setRemoteDescription(new RTCSessionDescription(content.sdp!));
+      await this.flushPendingIceCandidates(pubkey);
       return;
     }
 
     if (content.type == WebRTCEventType.IceCandidate) {
-      await this.webRTC
-        .getPeerConnection(pubkey)
-        ?.addIceCandidate(new RTCIceCandidate(content.candidate!));
+      const pc = this.webRTC.getPeerConnection(pubkey) ?? this.createConnection(pubkey);
+      if (!content.candidate) return;
+
+      if (!pc.remoteDescription) {
+        this.pendingIceCandidates[pubkey] ??= [];
+        this.pendingIceCandidates[pubkey].push(content.candidate);
+        return;
+      }
+
+      await pc.addIceCandidate(new RTCIceCandidate(content.candidate));
     }
   }
 }
